@@ -1,300 +1,106 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+# app.py
+from fastapi import FastAPI
+from pydantic import BaseModel
 import joblib
+import pandas as pd
 import numpy as np
-from pydantic import BaseModel, ValidationError, field_validator
-from typing import List, Optional
-import logging
-import os
+from datetime import datetime
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-
-# Load the model at startup
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'dish_top_model.joblib')
-model = None
+app = FastAPI()
+art = joblib.load("./model/dish_top_model.joblib")
+clf = art["model"]
+le_weekday = art["le_weekday"]
+le_season = art["le_season"]
+le_tempbucket = art["le_tempbucket"]
+le_top_dish = art["le_top_dish"]
+date_groups = art["date_groups"]  # historical top per date for averaging
 
 
-def load_model():
-    """Load the trained model from disk."""
-    global model
-    try:
-        model = joblib.load(MODEL_PATH)
-        logger.info(f"Model loaded successfully from {MODEL_PATH}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to load model: {str(e)}")
-        return False
+class PredictRequest(BaseModel):
+    date: str  # 'YYYY-MM-DD'
+    outside_temperature: float = None
+    is_raining: int = None  # 0 or 1
+    special_event: int = 0
+    is_holiday: int = 0
 
 
-# Pydantic models for request validation
-class PredictionRequest(BaseModel):
-    """Request model for prediction endpoint."""
-    features: List[float]
+@app.post("/predict")
+def predict(req: PredictRequest):
+    # parse date
+    dt = datetime.strptime(req.date, "%Y-%m-%d")
+    weekday = dt.strftime("%A")  # e.g., 'Monday'
+    # choose season mapping function (you must adapt mapping if your dataset uses different season labels)
+    month = dt.month
+    if month in [12, 1, 2]:
+        season = "winter"
+    elif month in [3, 4, 5]:
+        season = "spring"
+    elif month in [6, 7, 8]:
+        season = "summer"
+    else:
+        season = "autumn"
 
-    @field_validator('features')
-    @classmethod
-    def validate_features(cls, v):
-        if not v:
-            raise ValueError('Features list cannot be empty')
-        if any(not isinstance(x, (int, float)) for x in v):
-            raise ValueError('All features must be numeric values')
-        return v
+    # temp fallback: if not provided, use historical average for that day-of-year
+    if req.outside_temperature is None:
+        # approximate using date_groups median for same weekday
+        fallback = date_groups[date_groups["weekday"] == weekday][
+            "outside_temperature"
+        ].median()
+        temp = float(fallback) if not np.isnan(fallback) else 20.0
+    else:
+        temp = req.outside_temperature
 
+    # bucket temp to same bins used in training
+    import pandas as pd
 
-class BatchPredictionRequest(BaseModel):
-    """Request model for batch prediction endpoint."""
-    data: List[List[float]]
+    temp_bucket = pd.cut(
+        [temp], bins=[-50, 5, 15, 25, 50], labels=["very_cold", "cold", "mild", "hot"]
+    )[0]
 
-    @field_validator('data')
-    @classmethod
-    def validate_data(cls, v):
-        if not v:
-            raise ValueError('Data list cannot be empty')
-        if len(v) == 0:
-            raise ValueError('At least one sample is required')
-        return v
-
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint."""
-    return jsonify({
-        'status': 'healthy',
-        'model_loaded': model is not None
-    }), 200
-
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    """
-    Prediction endpoint for single sample.
-
-    Expects JSON body with:
-    {
-        "features": [feature1, feature2, ...]
-    }
-
-    Returns:
-    {
-        "prediction": prediction_result,
-        "success": true
-    }
-    """
-    if model is None:
-        return jsonify({
-            'error': 'Model not loaded',
-            'success': False
-        }), 503
-
-    try:
-        # Parse and validate request
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                'error': 'No JSON data provided',
-                'success': False
-            }), 400
-
-        # Validate using Pydantic
-        prediction_request = PredictionRequest(**data)
-
-        # Convert to numpy array and reshape for prediction
-        features = np.array(prediction_request.features).reshape(1, -1)
-
-        # Make prediction
-        prediction = model.predict(features)
-
-        # Check if model has predict_proba method for probabilities
-        probabilities = None
-        if hasattr(model, 'predict_proba'):
-            probabilities = model.predict_proba(features).tolist()
-
-        response = {
-            'prediction': prediction.tolist()[0] if isinstance(prediction, np.ndarray) else prediction,
-            'success': True
+    # encode features
+    X = pd.DataFrame(
+        {
+            "weekday": [
+                (
+                    le_weekday.transform([weekday])[0]
+                    if weekday in le_weekday.classes_
+                    else 0
+                )
+            ],
+            "season": [
+                le_season.transform([season])[0] if season in le_season.classes_ else 0
+            ],
+            "is_holiday": [int(req.is_holiday)],
+            "special_event": [int(req.special_event)],
+            "temp_bucket": [
+                (
+                    le_tempbucket.transform([str(temp_bucket)])[0]
+                    if str(temp_bucket) in le_tempbucket.classes_
+                    else 0
+                )
+            ],
+            "is_raining": [int(req.is_raining) if req.is_raining is not None else 0],
         }
+    )
 
-        if probabilities:
-            response['probabilities'] = probabilities[0]
+    pred_idx = clf.predict(X)[0]
+    proba = clf.predict_proba(X).max()
+    pred_dish = le_top_dish.inverse_transform([pred_idx])[0]
 
-        return jsonify(response), 200
+    # expected qty: historical average sold_quantity for this dish on matching weekday/season/is_holiday
+    hist = date_groups[date_groups["top_dish"] == pred_dish]
+    match = hist[
+        (hist["weekday"] == weekday)
+        & (hist["season"] == season)
+        & (hist["is_holiday"] == req.is_holiday)
+    ]
+    if len(match) == 0:
+        expected_qty = float(hist["top_qty"].mean())
+    else:
+        expected_qty = float(match["top_qty"].mean())
 
-    except ValidationError as e:
-        return jsonify({
-            'error': 'Validation error',
-            'details': e.errors(),
-            'success': False
-        }), 400
-    except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
-        return jsonify({
-            'error': f'Prediction failed: {str(e)}',
-            'success': False
-        }), 500
-
-
-@app.route('/predict/batch', methods=['POST'])
-def predict_batch():
-    """
-    Batch prediction endpoint for multiple samples.
-
-    Expects JSON body with:
-    {
-        "data": [
-            [feature1, feature2, ...],
-            [feature1, feature2, ...],
-            ...
-        ]
+    return {
+        "predicted_dish": pred_dish,
+        "confidence": float(proba),
+        "expected_sold_quantity": expected_qty,
     }
-
-    Returns:
-    {
-        "predictions": [prediction1, prediction2, ...],
-        "count": number_of_predictions,
-        "success": true
-    }
-    """
-    if model is None:
-        return jsonify({
-            'error': 'Model not loaded',
-            'success': False
-        }), 503
-
-    try:
-        # Parse and validate request
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                'error': 'No JSON data provided',
-                'success': False
-            }), 400
-
-        # Validate using Pydantic
-        batch_request = BatchPredictionRequest(**data)
-
-        # Convert to numpy array
-        features = np.array(batch_request.data)
-
-        # Make predictions
-        predictions = model.predict(features)
-
-        # Check if model has predict_proba method for probabilities
-        probabilities = None
-        if hasattr(model, 'predict_proba'):
-            probabilities = model.predict_proba(features).tolist()
-
-        response = {
-            'predictions': predictions.tolist() if isinstance(predictions, np.ndarray) else predictions,
-            'count': len(predictions),
-            'success': True
-        }
-
-        if probabilities:
-            response['probabilities'] = probabilities
-
-        return jsonify(response), 200
-
-    except ValidationError as e:
-        return jsonify({
-            'error': 'Validation error',
-            'details': e.errors(),
-            'success': False
-        }), 400
-    except Exception as e:
-        logger.error(f"Batch prediction error: {str(e)}")
-        return jsonify({
-            'error': f'Batch prediction failed: {str(e)}',
-            'success': False
-        }), 500
-
-
-@app.route('/model/info', methods=['GET'])
-def model_info():
-    """
-    Get information about the loaded model.
-
-    Returns:
-    {
-        "model_type": model_class_name,
-        "has_predict_proba": boolean,
-        "success": true
-    }
-    """
-    if model is None:
-        return jsonify({
-            'error': 'Model not loaded',
-            'success': False
-        }), 503
-
-    try:
-        info = {
-            'model_type': type(model).__name__,
-            'has_predict_proba': hasattr(model, 'predict_proba'),
-            'success': True
-        }
-
-        # Try to get additional model attributes if available
-        if hasattr(model, 'feature_importances_'):
-            info['has_feature_importances'] = True
-
-        if hasattr(model, 'n_features_in_'):
-            info['n_features'] = model.n_features_in_
-
-        if hasattr(model, 'classes_'):
-            info['classes'] = model.classes_.tolist()
-
-        return jsonify(info), 200
-
-    except Exception as e:
-        logger.error(f"Model info error: {str(e)}")
-        return jsonify({
-            'error': f'Failed to get model info: {str(e)}',
-            'success': False
-        }), 500
-
-
-@app.errorhandler(404)
-def not_found(error):
-    """Handle 404 errors."""
-    return jsonify({
-        'error': 'Endpoint not found',
-        'success': False
-    }), 404
-
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-    """Handle 405 errors."""
-    return jsonify({
-        'error': 'Method not allowed',
-        'success': False
-    }), 405
-
-
-@app.errorhandler(500)
-def internal_error(error):
-    """Handle 500 errors."""
-    logger.error(f"Internal error: {str(error)}")
-    return jsonify({
-        'error': 'Internal server error',
-        'success': False
-    }), 500
-
-
-if __name__ == '__main__':
-    # Load model before starting the server
-    if not load_model():
-        logger.error("Failed to load model. Server starting but predictions will fail.")
-
-    # Run the Flask app
-    port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('DEBUG', 'False').lower() == 'true'
-
-    logger.info(f"Starting Flask server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=debug)
-
